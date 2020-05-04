@@ -9,9 +9,9 @@ from sklearn.metrics import f1_score as f1
 from sklearn.metrics import precision_score as precision
 from sklearn.metrics import recall_score as recall
 
-class SegmentationModuleBase(nn.Module):
+class MultiModuleBase(nn.Module):
     def __init__(self):
-        super(SegmentationModuleBase, self).__init__()
+        super(MultiModuleBase, self).__init__()
 
     def pixel_acc(self, pred, label):
         _, preds = torch.max(pred, dim=1)
@@ -31,7 +31,7 @@ class SegmentationModuleBase(nn.Module):
     def iou(self, pred, label):
        pred =  np.array(pred.detach())
        n_classes = pred.shape[1]
-       if n_classes == 1: #sigmoid-bce
+       if n_classes == 1:
            n_classes = 2
            pred = (pred >= 0.5).astype('int32').flatten()
        else:
@@ -49,9 +49,9 @@ class SegmentationModuleBase(nn.Module):
        mean_iou = np.nanmean(I / U)
        return mean_iou
  
-class SegmentationModule(SegmentationModuleBase):
+class MultiModule(MultiModuleBase):
     def __init__(self, net_enc, net_dec, crit, deep_sup_scale=None):
-        super(SegmentationModule, self).__init__()
+        super(MultiModule, self).__init__()
         self.encoder = net_enc
         self.decoder = net_dec
         self.crit = crit
@@ -59,31 +59,19 @@ class SegmentationModule(SegmentationModuleBase):
 
     def forward(self, feed_dict, *, segSize=None):
         # training
-        if segSize is None and type(self.decoder) is not list:
+        if segSize is None:
             feed_dict = feed_dict[0]
-            pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True))
-
-            loss = self.crit(pred, feed_dict['sal_label'])
-            #loss = nn.functional.binary_cross_entropy(pred, feed_dict['sal_label'].float())
-
-            acc = self.pixel_acc(pred, feed_dict['sal_label'])
-            precision, recall, f1 = self.scores(pred, feed_dict['sal_label'])            
-            iou = self.iou(pred, feed_dict['sal_label'])
-            return loss, acc, precision, recall, f1, iou
-        # inference
-        elif segSize is not None and type(self.decoder) is not list:
-            pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True), segSize=segSize)
-            return pred
-        elif segSize is None and type(self.decoder) is list:
-            feed_dict = feed_dict[0]
-            in_ = self.encoder(feed_dict['img_data'], return_feature_maps=True)
-            pred1 = self.decoder[0](in_)
-            pred2 = self.decoder[1](in_)
+            in_ = self.encoder(feed_dict['img_data'], return_feature_maps=True) 
+            l1, pred1 = self.decoder[0](in_)
+            l2, pred2 = self.decoder[1](in_)
              
             loss1 = self.crit(pred1, feed_dict['seg_label'])
             loss2 = self.crit(pred2, feed_dict['sal_label'])
             #loss2 = nn.functional.binary_cross_entropy(pred2, feed_dict['sal_label'].float())
 
+            criterion = nn.KLDivLoss()  
+            loss = criterion(l1, l2)
+               
             acc1 = self.pixel_acc(pred1, feed_dict['seg_label'])
             precision1, recall1, f11 = self.scores(pred1, feed_dict['seg_label'])            
             iou1 = self.iou(pred1, feed_dict['seg_label'])
@@ -92,15 +80,15 @@ class SegmentationModule(SegmentationModuleBase):
             precision2, recall2, f12 = self.scores(pred2, feed_dict['sal_label'])            
             iou2 = self.iou(pred2, feed_dict['sal_label'])
 
-            return [loss1, loss2], [acc1, acc2], [precision1, precision2], [recall1, recall2], [f11, f12], [iou1, iou2]
+            return [loss1, loss2, loss], [acc1, acc2], [precision1, precision2], [recall1, recall2], [f11, f12], [iou1, iou2]
         # inference
         else:
-            in_ = self.encoder(feed_dict['img_data'], return_feature_maps=True),
+            in_ = self.encoder(feed_dict['img_data'], return_feature_maps=True)
             pred1 = self.decoder[0](in_, segSize=segSize)
             pred2 = self.decoder[1](in_, segSize=segSize)
             return [pred1, pred2]
 
-class ModelBuilder:
+class MultiBuilder:
     # custom weights initialization
     @staticmethod
     def weights_init(m):
@@ -129,7 +117,7 @@ class ModelBuilder:
         # encoders are usually pretrained
         # net_encoder.apply(ModelBuilder.weights_init)
         if len(weights) > 0:
-            print('Loading weights for net_encoder from', weights)
+            print('Loading weights for net_encoder')
             net_encoder.load_state_dict(
                 torch.load(weights, map_location=lambda storage, loc: storage))
         return net_encoder
@@ -139,45 +127,25 @@ class ModelBuilder:
                       fc_dim=512, num_class=150,
                       weights='', use_softmax=False):
         arch = arch.lower()
-        if arch == 'upernet':
-            net_decoder = UPerNet(
-                num_class=150,
-                fc_dim=fc_dim,
-                use_softmax=use_softmax,
-                fpn_dim=512)
-            if len(weights) > 0:
-                print('Loading weights for net_decoder from', weights)
-                net_decoder.load_state_dict(
-                torch.load(weights, map_location=lambda storage, loc: storage), strict=False)
-        if arch == 'upernet-sal':
-            net_decoder = UPerNetSal(
-                num_class=2,
-                fc_dim=fc_dim,
-                use_softmax=use_softmax,
-                fpn_dim=512)
-            if len(weights) > 0:
-                print('Loading weights for net_decoder from', weights)
-                net_decoder.load_state_dict(
-                torch.load(weights, map_location=lambda storage, loc: storage), strict=False)
-        elif arch == 'upernet-multi':
+        if arch == 'multi-uper':
             net_decoder1 = UPerNet(
-                num_class = 32,
+                num_class = 1,
                 fc_dim=fc_dim,
                 use_softmax=use_softmax,
                 fpn_dim=512)
             net_decoder2 = UPerNetSal(
-                num_class = 2,
+                num_class = 32,
                 fc_dim=fc_dim,
                 use_softmax=use_softmax,
                 fpn_dim=512)
             if len(weights) == 2 and len(weights[0]) > 0:
-                print('Loading weights for net_decoder1 from ', weights[0])
+                print('Loading weights for net_decoder 1')
                 net_decoder1.load_state_dict(
-                torch.load(weights[0], map_location=lambda storage, loc: storage), strict=False)
+                torch.load(weights[0], map_location=lambda storage, loc: storage))
             if len(weights) == 2 and len(weights[1]) > 0:
-                print('Loading weights for net_decoder2 from ', weights[1])
+                print('Loading weights for net_decoder 2')
                 net_decoder2.load_state_dict(
-                torch.load(weights[1], map_location=lambda storage, loc: storage), strict=False)
+                torch.load(weights[1], map_location=lambda storage, loc: storage))
             net_decoder = [net_decoder1, net_decoder2]
         else:
             raise Exception('Architecture undefined!')
@@ -279,11 +247,13 @@ class UPerNet(nn.Module):
 
         input_size = conv5.size()
         ppm_out = [conv5]
+
         for pool_scale, pool_conv in zip(self.ppm_pooling, self.ppm_conv):
-            ppm_out.append(pool_conv(nn.functional.interpolate(
-                pool_scale(conv5),
-                (input_size[2], input_size[3]),
-                mode='bilinear', align_corners=False)))
+            out = pool_conv(nn.functional.interpolate(
+                     pool_scale(conv5),
+                     (input_size[2], input_size[3]),
+                     mode='bilinear', align_corners=False))
+            ppm_out.append(out)
         ppm_out = torch.cat(ppm_out, 1)
         f = self.ppm_last_conv(ppm_out)
 
@@ -316,7 +286,7 @@ class UPerNet(nn.Module):
             return x
 
         x = nn.functional.log_softmax(x, dim=1)
-        return x
+        return fusion_out, x
 
 # upernet
 class UPerNetSal(nn.Module):
@@ -373,12 +343,15 @@ class UPerNetSal(nn.Module):
 
         input_size = conv5.size()
         ppm_out = [conv5]
+
         for pool_scale, pool_conv in zip(self.ppm_pooling, self.ppm_conv):
-            ppm_out.append(pool_conv(nn.functional.interpolate(
-                pool_scale(conv5),
-                (input_size[2], input_size[3]),
-                mode='bilinear', align_corners=False)))
+             out = pool_conv(nn.functional.interpolate(
+                      pool_scale(conv5),
+                      (input_size[2], input_size[3]),
+                      mode='bilinear', align_corners=False))
+             ppm_out.append(out)
         ppm_out = torch.cat(ppm_out, 1)
+ 
         f = self.ppm_last_conv(ppm_out)
 
         fpn_feature_list = [f]
@@ -410,6 +383,4 @@ class UPerNetSal(nn.Module):
             return x
 
         x = nn.functional.log_softmax(x, dim=1)
-        #x = self.sigmoid(x)
-        return x
-
+        return fusion_out, x
